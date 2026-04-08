@@ -4,6 +4,8 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js"
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv"
+import type { jsonSchemaValidator as JsonSchemaValidatorProvider, JsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/types.js"
 import {
   CallToolResultSchema,
   type Tool as MCPToolDef,
@@ -31,10 +33,34 @@ import { InstanceState } from "@/effect"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import * as CrossSpawnSpawner from "@/effect/cross-spawn-spawner"
 
-const log = Log.create({ service: "mcp" })
-const DEFAULT_TIMEOUT = 30_000
+/**
+ * Wraps AjvJsonSchemaValidator to catch schema compilation errors.
+ * opencode doesn't validate tool output schemas, so compilation failures
+ * (e.g. from complex or unsupported schemas) should not prevent tool discovery.
+ */
+class TolerantJsonSchemaValidator implements JsonSchemaValidatorProvider {
+  private inner = new AjvJsonSchemaValidator()
 
-export const Resource = z
+  getValidator<T>(schema: any): JsonSchemaValidator<T> {
+    try {
+      return this.inner.getValidator<T>(schema)
+    } catch {
+      return (input: unknown) => ({
+        valid: true as const,
+        data: input as T,
+        errorMessage: undefined,
+      })
+    }
+  }
+}
+
+const tolerantValidator = new TolerantJsonSchemaValidator()
+
+export namespace MCP {
+  const log = Log.create({ service: "mcp" })
+  const DEFAULT_TIMEOUT = 30_000
+
+  export const Resource = z
   .object({
     name: z.string(),
     uri: z.string(),
@@ -266,7 +292,7 @@ export const layer = Layer.effect(
         (t) =>
           Effect.tryPromise({
             try: () => {
-              const client = new Client({ name: "opencode", version: InstallationVersion })
+              const client = new Client({ name: "opencode", version: InstallationVersion }, { jsonSchemaValidator: tolerantValidator })
               return withTimeout(client.connect(t), timeout).then(() => client)
             },
             catch: (e) => (e instanceof Error ? e : new Error(String(e))),
@@ -318,7 +344,7 @@ export const layer = Layer.effect(
             requestInit: mcp.headers ? { headers: mcp.headers } : undefined,
           }),
         },
-      ]
+]
 
       const connectTimeout = mcp.timeout ?? DEFAULT_TIMEOUT
       let lastStatus: Status | undefined
@@ -770,7 +796,7 @@ export const layer = Layer.effect(
 
       return yield* Effect.tryPromise({
         try: () => {
-          const client = new Client({ name: "opencode", version: InstallationVersion })
+          const client = new Client({ name: "opencode", version: InstallationVersion }, { jsonSchemaValidator: tolerantValidator })
           return client
             .connect(transport)
             .then(() => ({ authorizationUrl: "", oauthState, client }) satisfies AuthResult)
@@ -929,4 +955,6 @@ export const defaultLayer = layer.pipe(
   Layer.provide(AppFileSystem.defaultLayer),
 )
 
-export * as MCP from "."
+} // namespace MCP
+
+export * as MCPNS from "."
